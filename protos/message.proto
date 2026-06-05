@@ -837,6 +837,7 @@ message Misc {
     bool uac = 15;
     bool foreground_window_elevated = 16;
     bool stop_service = 17;
+    bool shutdown_remote_device = 39;
     ElevationRequest elevation_request = 18;
     string elevation_response = 19;
     bool portable_service_running = 20;
