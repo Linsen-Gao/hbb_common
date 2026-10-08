@@ -1,6 +1,17 @@
 syntax = "proto3";
 package hbb;
 
+message IdPk {
+  string id = 1;
+  bytes pk = 2;
+  // DTLS certificate fingerprint of the signer's WebRTC endpoint, signed together with id/pk so
+  // a WebRTC peer's DTLS channel can be bound to its verified identity (defeats a rendezvous/relay
+  // that swaps SDP fingerprints). Empty for non-WebRTC handshakes.
+  string dtls_fingerprint = 3;
+  // Newest key exchange version the signer speaks; absent, i.e. 0, is the original scheme.
+  uint32 kx_version = 4;
+}
+
 message RegisterPeer {
   string id = 1;
   int32 serial = 2;
@@ -28,9 +39,37 @@ message PunchHoleRequest {
   bool force_relay = 8;
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
+  string switch_code = 11;
+  // The offer's envelope declares its own ICE transport policy (`ice_policy` key inside
+  // the webrtc:// payload): under force_relay it tells the peer whether the relay is
+  // transport-forced (WebSocket — answer may use full ICE) or policy (Relay-only + TURN).
+  string webrtc_sdp_offer = 12;
 }
 
-message PunchHole { 
+message ControlPermissions {
+  enum Permission {
+    keyboard = 0;
+    remote_printer = 1;
+    clipboard = 2;
+    file = 3;
+    audio = 4;
+    camera = 5;
+    terminal = 6;
+    tunnel = 7;
+    restart = 8;
+    recording = 9;
+    block_input = 10;
+    remote_modify = 11;
+    privacy_mode = 12;
+  }
+  uint64 permissions = 1;
+}
+
+message ControlledContext {
+  string conn_audit_ref = 1;
+}
+
+message PunchHole {
   bytes socket_addr = 1;
   string relay_server = 2;
   NatType nat_type = 3;
@@ -38,6 +77,9 @@ message PunchHole {
   bool force_relay = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
+  ControlPermissions control_permissions = 8;
+  ControlledContext controlled_context = 9;
+  string webrtc_sdp_offer = 10;
 }
 
 message TestNatRequest {
@@ -64,6 +106,7 @@ message PunchHoleSent {
   string version = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
+  string webrtc_sdp_answer = 8;
 }
 
 message RegisterPk {
@@ -83,6 +126,7 @@ message RegisterPkResponse {
     INVALID_ID_FORMAT = 5;
     NOT_SUPPORT = 6;
     SERVER_ERROR = 7;
+    NOT_DEPLOYED = 8;
   }
   Result result = 1;
   int32 keep_alive = 2;
@@ -108,6 +152,7 @@ message PunchHoleResponse {
   bool is_udp = 9;
   int32 upnp_port = 10;
   bytes socket_addr_v6 = 11;
+  string webrtc_sdp_answer = 12;
 }
 
 message ConfigUpdate {
@@ -124,6 +169,9 @@ message RequestRelay {
   string licence_key = 6;
   ConnType conn_type = 7;
   string token = 8;
+  ControlPermissions control_permissions = 9;
+  ControlledContext controlled_context = 10;
+  string switch_code = 11;
 }
 
 message RelayResponse {
@@ -139,6 +187,7 @@ message RelayResponse {
   int32 feedback = 9;
   bytes socket_addr_v6 = 10;
   int32 upnp_port = 11;
+  string webrtc_sdp_answer = 12;
 }
 
 message SoftwareUpdate { string url = 1; }
@@ -147,10 +196,12 @@ message SoftwareUpdate { string url = 1; }
 // even some router has below connection error if we connect itself,
 //  { kind: Other, error: "could not resolve to any address" },
 // so we request local address to connect.
-message FetchLocalAddr { 
-  bytes socket_addr = 1; 
+message FetchLocalAddr {
+  bytes socket_addr = 1;
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
+  ControlPermissions control_permissions = 4;
+  ControlledContext controlled_context = 5;
 }
 
 message LocalAddr {
@@ -183,10 +234,49 @@ message OnlineResponse {
 
 message KeyExchange {
   repeated bytes keys = 1; 
+  // From the server: the newest key exchange version it speaks. From the client: the version it
+  // picked, the highest both speak. Absent, i.e. 0, is the original scheme.
+  uint32 version = 2;
+  // Server signature of KxParams. Bit 255 of the signed X25519 public key requires this field;
+  // legacy keys leave it clear.
+  bytes signed_params = 3;
+}
+
+// Signed by the server beside its ephemeral public key: that key as it went out, so the signature
+// belongs to this exchange alone, and the newest key exchange version the server speaks.
+message KxParams {
+  bytes pk = 1;
+  uint32 version = 2;
 }
 
 message HealthCheck {
   string token = 1;
+}
+
+message HeaderEntry {
+  string name = 1;
+  string value = 2;
+}
+
+message HttpProxyRequest {
+  string method = 1;
+  string path = 2;
+  repeated HeaderEntry headers = 3;
+  bytes body = 4;
+}
+
+message HttpProxyResponse {
+  int32 status = 1;
+  repeated HeaderEntry headers = 2;
+  bytes body = 3;
+  string error = 4;
+}
+
+message IceCandidate {
+  string id = 1;
+  bytes socket_addr = 2;
+  string session_key = 3;
+  string candidate = 4;
 }
 
 message RendezvousMessage {
@@ -212,5 +302,8 @@ message RendezvousMessage {
     OnlineResponse online_response = 24;
     KeyExchange key_exchange = 25;
     HealthCheck hc = 26;
+    HttpProxyRequest http_proxy_request = 27;
+    HttpProxyResponse http_proxy_response = 28;
+    IceCandidate ice_candidate = 29;
   }
 }

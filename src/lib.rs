@@ -1,11 +1,9 @@
 pub mod compress;
-pub mod platform;
 pub mod protos;
 pub use bytes;
 use config::Config;
 pub use futures;
 pub use protobuf;
-pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
 use serde_derive::{Deserialize, Serialize};
 use std::{
@@ -27,7 +25,6 @@ pub mod bytes_codec;
 pub use anyhow::{self, bail};
 pub use futures_util;
 pub mod config;
-pub mod fs;
 pub mod mem;
 pub use lazy_static;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -42,7 +39,8 @@ pub mod password_security;
 pub use chrono;
 pub use directories_next;
 pub use libc;
-pub mod keyboard;
+#[cfg(target_os = "linux")]
+pub mod sh;
 pub use base64;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use dlopen;
@@ -57,10 +55,24 @@ pub use toml;
 pub use uuid;
 pub mod fingerprint;
 pub use flexi_logger;
-pub mod websocket;
+pub mod log_throttle;
+pub mod rx_probe;
 pub mod stream;
+pub mod websocket;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub use rustls_platform_verifier;
 pub use stream::Stream;
 pub use whoami;
+pub mod tls;
+pub mod verifier;
+pub use async_recursion;
+#[cfg(target_os = "linux")]
+pub use users;
+pub use libloading;
+#[cfg(target_os = "linux")]
+pub use x11;
 
 pub type SessionID = uuid::Uuid;
 
@@ -300,10 +312,65 @@ pub fn get_exe_time() -> SystemTime {
     })
 }
 
+/// Known cases where machine_uid::get() may fail:
+/// - Windows shutdown: "The media is write protected. (os error 19)"
+/// - macOS (hard to reproduce, reproduced at login screen): "No matching IOPlatformUUID in `ioreg -rd1 -c IOPlatformExpertDevice` command"
 pub fn get_uuid() -> Vec<u8> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    if let Ok(id) = machine_uid::get() {
-        return id.into();
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CACHED_MACHINE_UID: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        // Throttle only applies to the fallback machine_uid::get() log below, not the Once::call_once retry logs.
+        static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        // Only macOS needs retry logic here because:
+        // - macOS: in testing, only one failure occurred when reading at 50ms intervals, so retry helps
+        // - Windows: failures during shutdown are persistent, retrying is pointless
+        #[cfg(target_os = "macos")]
+        {
+            static INIT: std::sync::Once = std::sync::Once::new();
+            INIT.call_once(|| {
+                // Keep in sync with upstream handling:
+                // https://github.com/rustdesk/rustdesk/blob/85db6779828349b23ca3eba91cc7cd36c5337797/src/common.rs#L822
+                let username = whoami::username().trim_end_matches('\0').to_owned();
+                let max_retries = if username == "root" { 16 } else { 8 };
+                for i in 0..max_retries {
+                    match machine_uid::get() {
+                        Ok(id) => {
+                            let _ = CACHED_MACHINE_UID.set(id.into());
+                            return;
+                        }
+                        Err(e) => {
+                            log::error!("Failed to get machine uid in macOS retry #{i}: {e}");
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+        }
+
+        if let Some(uid) = CACHED_MACHINE_UID.get() {
+            return uid.clone();
+        }
+
+        match machine_uid::get() {
+            Ok(id) => {
+                let uid: Vec<u8> = id.into();
+                let _ = CACHED_MACHINE_UID.set(uid.clone());
+                return uid;
+            }
+            Err(e) => {
+                if LOG_COUNT
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                        (count < 30).then_some(count + 1)
+                    })
+                    .is_ok()
+                {
+                    log::error!("Failed to get machine uid: {e}");
+                }
+            }
+        }
     }
     Config::get_key_pair().1
 }
@@ -362,10 +429,15 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
     #[allow(unused_mut)]
     let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
     INIT.call_once(|| {
+        // webrtc-rs reports the racing design's normal outcome at warn: cancelling the transport
+        // that lost closes every gathered candidate one line at a time, and trickle means the
+        // agent always checks before it holds a pair. Both read as faults beside a connection
+        // that succeeded. agent_gather keeps its warn level - a STUN server it could not reach
+        // is the one upstream signal that explains a session which never connected.
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info"));
+            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,hyper_util=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error"));
         }
         #[cfg(not(debug_assertions))]
         {
@@ -380,7 +452,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug") {
+            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,hyper_util=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error") {
                 logger_holder = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {
@@ -390,9 +462,19 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     })
                     .format(opt_format)
                     .rotate(
-                        Criterion::Age(Age::Day),
+                        // Size as well as age: rotating only daily lets one day's file grow
+                        // without limit, so whoever can drive a hot log site — a peer sending
+                        // malformed packets, a socket erroring in a retry loop — decides how
+                        // much disk this uses. Bounding it here covers every call site at once.
+                        Criterion::AgeOrSize(Age::Day, 16 * 1024 * 1024),
                         Naming::Timestamps,
-                        Cleanup::KeepLogFiles(31),
+                        // 90 files is ~90 days for any machine that stays under the
+                        // size criterion — i.e. every ordinary install, on every platform this
+                        // ships to. Raising it to protect the flood case would have bought little
+                        // (a count cannot outrun a flood; only the rate limits at the log sites
+                        // can) at the price of multiplying steady-state retention and disk for
+                        // everyone.
+                        Cleanup::KeepLogFiles(90),
                     )
                     .start()
                     .ok();
