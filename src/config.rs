@@ -115,7 +115,7 @@ const CHARS: &[char] = &[
 ];
 
 pub const RENDEZVOUS_SERVERS: &[&str] = &["rd.bskl.fun"];
-pub const RS_PUB_KEY: &str = "JFAyFH2DLreKaiEjhd0RuKwCHZ8DHJDEfSCsuKtqkzw=";
+pub const RS_PUB_KEY: &str = "Xjd+2TfWmMvkRt5tPYunl75ZlHMtangD62gik9B7Q1E=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
